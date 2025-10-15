@@ -21,7 +21,7 @@ enum {
 
 // Version definitions
 #define PACKED_NVSE_VERSION 0x06010000  // NVSE 6.1.0
-#define RUNTIME_VERSION_1_4_0_525 0x040000525
+#define RUNTIME_VERSION_1_4_MIN   0x04000000  // Fallout New Vegas 1.4.x.x (any 1.4 version)
 
 struct PluginInfo {
     enum {

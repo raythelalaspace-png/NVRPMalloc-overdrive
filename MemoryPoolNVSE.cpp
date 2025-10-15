@@ -150,10 +150,12 @@ extern "C" bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info)
     }
 
     if (!nvse->isEditor) {
-        if (nvse->runtimeVersion < RUNTIME_VERSION_1_4_0_525) {
-            gLog.Log("Incorrect runtime version (got %08X need at least %08X)", nvse->runtimeVersion, RUNTIME_VERSION_1_4_0_525);
+        // Check for minimum 1.4.x version (accept any 1.4.x.x version)
+        if ((nvse->runtimeVersion & 0xFF000000) < RUNTIME_VERSION_1_4_MIN) {
+            gLog.Log("Incorrect runtime version (got %08X need at least 1.4.x.x)", nvse->runtimeVersion);
             return false;
         }
+        gLog.Log("Runtime version check passed (got %08X)", nvse->runtimeVersion);
 
         if (nvse->isNogore) {
             gLog.Log("NoGore is not supported");
