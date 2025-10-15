@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <ctime>
 #include <cstdarg>
+#include <winnt.h>
+#include <psapi.h>
 
 // Plugin globals
 SimpleLog gLog("MemoryPoolNV.log");
@@ -20,6 +22,150 @@ malloc_func g_je_malloc = nullptr;
 free_func g_je_free = nullptr;
 calloc_func g_je_calloc = nullptr;
 realloc_func g_je_realloc = nullptr;
+
+// PE Section management
+struct CodeSection {
+    void* baseAddress;
+    size_t size;
+    DWORD originalProtection;
+    bool isActive;
+};
+
+CodeSection g_codeSection = { nullptr, 0, 0, false };
+
+// Get the main executable module information
+static bool GetExecutableInfo(HMODULE* hModule, PIMAGE_DOS_HEADER* dosHeader, PIMAGE_NT_HEADERS* ntHeaders) {
+    *hModule = GetModuleHandle(nullptr);  // Get main EXE
+    if (!*hModule) {
+        gLog.Log("Failed to get main module handle");
+        return false;
+    }
+
+    *dosHeader = (PIMAGE_DOS_HEADER)*hModule;
+    if ((*dosHeader)->e_magic != IMAGE_DOS_SIGNATURE) {
+        gLog.Log("Invalid DOS signature in main executable");
+        return false;
+    }
+
+    *ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)*hModule + (*dosHeader)->e_lfanew);
+    if ((*ntHeaders)->Signature != IMAGE_NT_SIGNATURE) {
+        gLog.Log("Invalid NT signature in main executable");
+        return false;
+    }
+
+    return true;
+}
+
+// Create a new executable section in the process
+static bool CreateCodeSection(size_t sectionSize = 0x10000) {  // Default 64KB
+    gLog.Log("MemoryPoolNVSE: Creating new executable code section (%zu bytes)...", sectionSize);
+
+    HMODULE hModule;
+    PIMAGE_DOS_HEADER dosHeader;
+    PIMAGE_NT_HEADERS ntHeaders;
+
+    if (!GetExecutableInfo(&hModule, &dosHeader, &ntHeaders)) {
+        return false;
+    }
+
+    // Log current executable information
+    gLog.Log("Main executable base address: %p", hModule);
+    gLog.Log("Image size: %u bytes", ntHeaders->OptionalHeader.SizeOfImage);
+    gLog.Log("Number of sections: %u", ntHeaders->FileHeader.NumberOfSections);
+
+    // Find a suitable address for our new section
+    // We'll allocate after the existing image but within the same address space
+    BYTE* baseAddr = (BYTE*)hModule + ntHeaders->OptionalHeader.SizeOfImage;
+    
+    // Round up to page boundary
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    size_t pageSize = sysInfo.dwPageSize;
+    baseAddr = (BYTE*)((ULONG_PTR)(baseAddr + pageSize - 1) & ~(pageSize - 1));
+
+    gLog.Log("Attempting to allocate code section at: %p", baseAddr);
+
+    // Try to allocate memory at the calculated address
+    void* allocatedMemory = VirtualAlloc(
+        baseAddr,
+        sectionSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE
+    );
+
+    if (!allocatedMemory) {
+        // If that fails, let Windows choose the address
+        gLog.Log("Fixed address allocation failed, letting Windows choose address...");
+        allocatedMemory = VirtualAlloc(
+            nullptr,
+            sectionSize,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE
+        );
+    }
+
+    if (!allocatedMemory) {
+        gLog.Log("ERROR - Failed to allocate executable memory: %u", GetLastError());
+        return false;
+    }
+
+    // Store section information
+    g_codeSection.baseAddress = allocatedMemory;
+    g_codeSection.size = sectionSize;
+    g_codeSection.originalProtection = PAGE_EXECUTE_READWRITE;
+    g_codeSection.isActive = true;
+
+    gLog.Log("SUCCESS - Code section created at: %p (size: %zu bytes)", 
+             allocatedMemory, sectionSize);
+
+    // Initialize the section with a signature pattern for debugging
+    memset(allocatedMemory, 0xCC, sectionSize);  // Fill with INT3 breakpoints
+    
+    // Write a small signature at the beginning
+    const char signature[] = "MEMORYPOOLNVSE_CODESECTION";
+    memcpy(allocatedMemory, signature, min(sizeof(signature), sectionSize));
+
+    gLog.Log("Code section initialized with debug signature");
+    return true;
+}
+
+// Clean up the code section
+static void DestroyCodeSection() {
+    if (g_codeSection.isActive && g_codeSection.baseAddress) {
+        gLog.Log("Destroying code section at: %p", g_codeSection.baseAddress);
+        
+        if (VirtualFree(g_codeSection.baseAddress, 0, MEM_RELEASE)) {
+            gLog.Log("Code section successfully freed");
+        } else {
+            gLog.Log("WARNING - Failed to free code section: %u", GetLastError());
+        }
+
+        g_codeSection.baseAddress = nullptr;
+        g_codeSection.size = 0;
+        g_codeSection.originalProtection = 0;
+        g_codeSection.isActive = false;
+    }
+}
+
+// Get information about our code section
+static void LogCodeSectionInfo() {
+    if (!g_codeSection.isActive) {
+        gLog.Log("No active code section");
+        return;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(g_codeSection.baseAddress, &mbi, sizeof(mbi))) {
+        gLog.Log("Code section info:");
+        gLog.Log("  Base Address: %p", mbi.BaseAddress);
+        gLog.Log("  Size: %zu bytes", mbi.RegionSize);
+        gLog.Log("  State: %s", (mbi.State == MEM_COMMIT) ? "Committed" : "Reserved");
+        gLog.Log("  Protection: 0x%X", mbi.Protect);
+        gLog.Log("  Type: %s", (mbi.Type == MEM_PRIVATE) ? "Private" : "Other");
+    } else {
+        gLog.Log("Failed to query code section memory info");
+    }
+}
 
 // Load jemalloc DLL and get function pointers
 static bool LoadJEmalloc() {
@@ -90,23 +236,39 @@ static bool TestJEmalloc() {
 
 // Initialize the memory pool
 static void InitializeMemoryPool() {
-    gLog.Log("MemoryPoolNV: Starting initialization...");
+    gLog.Log("MemoryPoolNVSE: Starting initialization...");
 
+    // Step 1: Create executable code section for future IAT hooking
+    gLog.Log("=== PHASE 1: Code Section Creation ===");
+    if (CreateCodeSection()) {
+        gLog.Log("MemoryPoolNVSE: SUCCESS - Code section created and ready for injection");
+        LogCodeSectionInfo();
+    } else {
+        gLog.Log("MemoryPoolNVSE: WARNING - Code section creation failed, IAT features will be disabled");
+    }
+
+    // Step 2: Initialize jemalloc memory allocation
+    gLog.Log("=== PHASE 2: Memory Allocator Initialization ===");
     if (LoadJEmalloc()) {
-        gLog.Log("MemoryPoolNV: SUCCESS - jemalloc.dll loaded successfully");
+        gLog.Log("MemoryPoolNVSE: SUCCESS - jemalloc.dll loaded successfully");
 
         if (TestJEmalloc()) {
-            gLog.Log("MemoryPoolNV: SUCCESS - jemalloc functionality verified");
-            gLog.Log("MemoryPoolNV: Memory pool initialization COMPLETE - All systems operational");
+            gLog.Log("MemoryPoolNVSE: SUCCESS - jemalloc functionality verified");
         }
         else {
-            gLog.Log("MemoryPoolNV: WARNING - jemalloc loaded but functionality test failed");
+            gLog.Log("MemoryPoolNVSE: WARNING - jemalloc loaded but functionality test failed");
         }
     }
     else {
-        gLog.Log("MemoryPoolNV: ERROR - Failed to load jemalloc.dll");
-        gLog.Log("MemoryPoolNV: Memory pool will use default system allocator");
+        gLog.Log("MemoryPoolNVSE: INFO - jemalloc.dll not found, using system allocator");
     }
+
+    // Step 3: Final status
+    gLog.Log("=== INITIALIZATION COMPLETE ===");
+    gLog.Log("Status Summary:");
+    gLog.Log("  Code Section: %s", g_codeSection.isActive ? "ACTIVE" : "INACTIVE");
+    gLog.Log("  Memory Allocator: %s", g_je_malloc ? "jemalloc" : "system");
+    gLog.Log("MemoryPoolNVSE: All systems operational");
 }
 
 // NVSE message handler
@@ -122,11 +284,19 @@ void MessageHandler(NVSEMessagingInterface::Message* msg)
         InitializeMemoryPool();
         break;
     case NVSEMessagingInterface::kMessage_ExitGame:
-        gLog.Log("MemoryPoolNV: Game exiting, shutting down...");
+        gLog.Log("MemoryPoolNVSE: Game exiting, shutting down...");
+        
+        // Cleanup code section
+        DestroyCodeSection();
+        
+        // Cleanup jemalloc
         if (g_jemallocDLL) {
+            gLog.Log("Unloading jemalloc.dll...");
             FreeLibrary(g_jemallocDLL);
             g_jemallocDLL = nullptr;
         }
+        
+        gLog.Log("MemoryPoolNVSE: Shutdown complete");
         break;
     default:
         break;
@@ -208,8 +378,31 @@ extern "C" {
 
     __declspec(dllexport) const char* GetMemoryPoolStatus() {
         if (g_jemallocDLL && g_je_malloc) {
-            return "MemoryPoolNV: Operational - Using jemalloc";
+            return "MemoryPoolNVSE: Operational - Using jemalloc";
         }
-        return "MemoryPoolNV: Fallback - Using system allocator";
+        return "MemoryPoolNVSE: Fallback - Using system allocator";
+    }
+
+    // Code section access functions
+    __declspec(dllexport) void* GetCodeSectionBase() {
+        return g_codeSection.isActive ? g_codeSection.baseAddress : nullptr;
+    }
+
+    __declspec(dllexport) size_t GetCodeSectionSize() {
+        return g_codeSection.isActive ? g_codeSection.size : 0;
+    }
+
+    __declspec(dllexport) bool IsCodeSectionActive() {
+        return g_codeSection.isActive;
+    }
+
+    __declspec(dllexport) const char* GetCodeSectionStatus() {
+        if (g_codeSection.isActive) {
+            static char statusBuffer[256];
+            sprintf_s(statusBuffer, "Code Section: Active at %p (%zu bytes)", 
+                     g_codeSection.baseAddress, g_codeSection.size);
+            return statusBuffer;
+        }
+        return "Code Section: Inactive";
     }
 }

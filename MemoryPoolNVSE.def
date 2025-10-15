@@ -5,3 +5,7 @@ NVSEPlugin_Load
 MemoryPoolMalloc
 MemoryPoolFree
 GetMemoryPoolStatus
+GetCodeSectionBase
+GetCodeSectionSize
+IsCodeSectionActive
+GetCodeSectionStatus
