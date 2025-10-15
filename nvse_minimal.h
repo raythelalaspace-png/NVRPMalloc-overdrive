@@ -16,12 +16,12 @@ enum {
 };
 
 enum {
-    kInterface_Messaging = 2,
+    kInterface_Messaging = 3,
 };
 
-// Version definitions
-#define PACKED_NVSE_VERSION 0x06010000  // NVSE 6.1.0
-#define RUNTIME_VERSION_1_4_MIN   0x04000000  // Fallout New Vegas 1.4.x.x (any 1.4 version)
+// Version definitions (relaxed to ensure compatibility with NVSE/xNVSE)
+#define PACKED_NVSE_VERSION 0x00010000  // Minimum NVSE version (very permissive)
+#define RUNTIME_VERSION_1_4_MIN   0x01040000  // Fallout New Vegas 1.4.x.x minimum
 
 struct PluginInfo {
     enum {
@@ -90,6 +90,20 @@ struct NVSEInterface {
     UInt32 isNogore;
     void (*InitExpressionEvaluatorUtils)(void* utils);
     bool (*RegisterTypedCommandVersion)(void* info, UInt8 retnType, UInt32 requiredPluginVersion);
+};
+
+// Command structures for NVSE scripts
+#define COMMAND_ARGS UInt32 paramCount, void* scriptData, void* opcodeOffsetPtr, void* scriptObj, void* containingObj, void* thisObj, void* arg1, void* arg2, double* result
+
+struct CommandInfo {
+    const char* longName;
+    const char* shortName;
+    UInt32 opcode;
+    const char* helpText;
+    UInt32 needsParent;
+    UInt32 numParams;
+    void* params;
+    bool (*execute)(COMMAND_ARGS);
 };
 
 // Function declarations that NVSE expects to find

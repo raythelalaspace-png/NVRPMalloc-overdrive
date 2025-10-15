@@ -1,0 +1,4 @@
+LIBRARY "MemoryPoolNVSE_RPmalloc"
+EXPORTS
+NVSEPlugin_Query
+NVSEPlugin_Load

@@ -1,0 +1,27 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-msbuild:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release | Win32)
+        shell: pwsh
+        run: |
+          msbuild MemoryPoolNVSE_RPmalloc.vcxproj /p:Configuration=Release /p:Platform=Win32 /m /v:minimal
+
+      - name: Publish DLL artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemoryPoolNVSE_RPmalloc-Release-Win32
+          path: Release/MemoryPoolNVSE_RPmalloc.dll

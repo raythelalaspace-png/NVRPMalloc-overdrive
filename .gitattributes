@@ -1,0 +1,19 @@
+* text=auto eol=crlf
+
+# Visual Studio project/solution files
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+*.vcxproj.filters text eol=crlf
+
+# Source files
+*.c text eol=crlf
+*.cpp text eol=crlf
+*.h text eol=crlf
+*.hpp text eol=crlf
+
+# Scripts
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Docs
+*.md text eol=lf

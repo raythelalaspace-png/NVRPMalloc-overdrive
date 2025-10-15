@@ -3,23 +3,42 @@
 *.user
 *.suo
 *.vcxproj.user
+*.vcxproj.filters.user
+
+# IDE
+.vscode/
+.idea/
 
 # Build outputs
 Debug/
 Release/
 x64/
 x86/
+ipch/
+out/
+bin/
+obj/
 *.obj
+*.iobj
 *.pch
+*.ipch
 *.tlog
 *.log
 *.idb
 *.pdb
+*.ipdb
 *.ilk
 *.exp
 *.lib
 *.dll
 *.exe
+
+# Intermediate/DB
+*.opensdf
+*.sdf
+*.cache
+*.VC.db
+*.VC.opendb
 
 # Temporary files
 *.tmp
@@ -35,8 +54,5 @@ x86/
 ehthumbs.db
 Thumbs.db
 
-# Runtime logs (but keep the source)
-*.log
-
-# But keep the built DLL for distribution
-!MemoryPoolNVSE.dll
+# Backups
+*.backup
