@@ -101,7 +101,9 @@ The plugin creates `MemoryPoolNVSE.log` in your game directory with detailed inf
 
 2. **Open in Visual Studio**:
    ```bash
+   # Double-click the solution file or use:
    start MemoryPoolNVSE.sln
+   # Or from Visual Studio: File → Open → Project/Solution → MemoryPoolNVSE.sln
    ```
 
 3. **Build Configuration**:
@@ -121,7 +123,10 @@ MemoryPoolNVSE/
 ├── nvse_minimal.h          # Minimal NVSE plugin interface
 ├── MemoryPoolNVSE.def      # Export definitions
 ├── MemoryPoolNVSE.vcxproj  # Visual Studio project file
+├── MemoryPoolNVSE.sln      # Visual Studio solution file
 ├── README.md               # This file
+├── LICENSE                 # MIT License
+├── CHANGELOG.md            # Version history
 └── .gitignore              # Git ignore rules
 ```
 
