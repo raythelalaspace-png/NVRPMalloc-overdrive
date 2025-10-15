@@ -1,0 +1,7 @@
+LIBRARY "MemoryPoolNVSE"
+EXPORTS
+NVSEPlugin_Query
+NVSEPlugin_Load
+MemoryPoolMalloc
+MemoryPoolFree
+GetMemoryPoolStatus
