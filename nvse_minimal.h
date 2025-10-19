@@ -107,10 +107,12 @@ struct CommandInfo {
 };
 
 // Function declarations that NVSE expects to find
+#ifndef NVSE_NO_EXPORT_DECL
 extern "C" {
     bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info);
     bool NVSEPlugin_Load(NVSEInterface* nvse);
 }
+#endif
 
 // Logging class - simplified version
 class SimpleLog {

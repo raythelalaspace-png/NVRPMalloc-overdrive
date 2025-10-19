@@ -15,12 +15,22 @@
 
 #include "nvse_minimal.h"
 #include "rpmalloc.h"
+#include "OverdriveConfig.h"
+#include "memory_budgets.h"
+#include "performance_patcher.h"
+#include "virtualfree_hook.h"
 #include <windows.h>
 #include <stdint.h>
 #include <intrin.h>
 #include <psapi.h>
 #include <cstdio>
 #include <cstdarg>
+#include <io.h>
+
+// Forward declarations for NVSE command callbacks
+static bool Cmd_ReloadOverdrive_Execute(COMMAND_ARGS);
+static bool Cmd_GetBudgets_Execute(COMMAND_ARGS);
+static bool Cmd_DumpHeaps_Execute(COMMAND_ARGS);
 
 // ============================================================================
 // UNIFIED CONFIGURATION SYSTEM - Enhanced with Heap Integration
@@ -72,12 +82,12 @@
 #define RESERVE_MIN_SIZE            (64ULL * 1024ULL * 1024ULL)  // minimum 64 MB per pool
 
 // Feature Control System
-#define ENABLE_NATIVE_HEAP_INTEGRATION  1   // Native Fallout NV heap integration
-#define ENABLE_SCRAP_CACHE_SYSTEM      1   // ScrapHeap cache overlay
-#define ENABLE_SIZE_CLASS_SYSTEM       1   // 64 size-class optimization
-#define ENABLE_SEGMENT_MANAGEMENT      1   // Advanced segment allocation
-#define ENABLE_BLOCK_COALESCING        1   // Zero-fragmentation coalescing
-#define ENABLE_BITMAP_OPTIMIZATION     1   // Fast free block discovery
+#define ENABLE_NATIVE_HEAP_INTEGRATION  0   // Using rpmalloc as allocator
+#define ENABLE_SCRAP_CACHE_SYSTEM      0   // Disabled; rpmalloc handles small-object caches
+#define ENABLE_SIZE_CLASS_SYSTEM       0   // Disabled legacy size classes
+#define ENABLE_SEGMENT_MANAGEMENT      0   // Disabled custom heap segments
+#define ENABLE_BLOCK_COALESCING        0   // Disabled
+#define ENABLE_BITMAP_OPTIMIZATION     0   // Disabled
 #define ENABLE_ERROR_RECOVERY          1   // Advanced error handling
 #ifndef ENABLE_DEBUG_LOGGING
 #define ENABLE_DEBUG_LOGGING           1   // Comprehensive logging
@@ -209,27 +219,6 @@ struct CustomHeapManager {
     CRITICAL_SECTION heap_lock;     // Global heap synchronization
 };
 
-// Multi-tier memory pool (enhanced)
-struct EnhancedMemoryPool {
-    void* base;                     // Pool base address
-    volatile LONG64 used;           // Current offset (atomic)
-    volatile LONG64 committed;      // Actually committed memory
-    SIZE_T size;                    // Total pool size
-    SIZE_T alignment;               // Pool alignment requirement
-    volatile LONG64 allocs;         // Total allocations from this pool
-    volatile LONG64 bytes_served;   // Total bytes allocated
-    volatile LONG64 peak_usage;     // Peak memory usage
-    const char* name;               // Pool identifier
-    uint32_t pool_id;               // Numeric pool ID
-    
-    // Enhanced features
-    volatile LONG64 fast_allocations; // Allocations served directly
-    volatile LONG64 overflow_count;    // Overflows to other tiers
-    uint64_t last_reset_tick;          // Last pool reset timestamp
-    
-    CRITICAL_SECTION pool_lock;     // Pool synchronization
-    volatile LONG active;           // Pool active flag
-};
 
 // Comprehensive system statistics
 struct HeapSystemStats {
@@ -276,22 +265,21 @@ struct HeapSystemStats {
 // GLOBAL SYSTEM STATE - Enhanced Multi-Tier Architecture
 // ============================================================================
 
-// Multi-tier memory pools
-static EnhancedMemoryPool g_primary_pool = {0};
-static EnhancedMemoryPool g_secondary_pool = {0};
-static EnhancedMemoryPool g_texture_pool = {0};
-static EnhancedMemoryPool* g_pools[] = { &g_primary_pool, &g_secondary_pool, &g_texture_pool };
-static const int g_num_pools = sizeof(g_pools) / sizeof(g_pools[0]);
-
-// Custom heap system
-static CustomHeapManager g_custom_heap = {0};
-static ScrapHeapManager g_scrap_cache = {0};
+// Legacy pool/custom heap globals removed (rpmalloc in use)
 
 // System state
 static volatile LONG g_system_initialized = 0;
 static volatile LONG g_critical_sections_initialized = 0;
 static volatile LONG g_shutting_down = 0;
 static volatile LONG g_memory_mode = MEMORY_MODE_HYBRID;
+static OverdriveConfig g_cfg; // loaded from INI
+
+// Telemetry counters
+static volatile LONG64 g_t_allocs = 0;
+static volatile LONG64 g_t_frees = 0;
+static volatile LONG64 g_t_bytes_alloc = 0;
+static volatile LONG64 g_t_bytes_free = 0;
+static volatile LONG g_frame_counter = 0;
 
 // Critical sections (following game pattern)
 static CRITICAL_SECTION g_stats_lock;
@@ -306,17 +294,7 @@ static HeapSystemStats g_stats = {0};
 static HANDLE g_process_heap = NULL;
 static HANDLE g_fallback_heap = NULL;
 
-// Size class lookup tables
-static const size_t g_size_class_sizes[SIZE_CLASSES] = {
-    16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256,
-    272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512,
-    528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768,
-    784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960, 976, 992, 1008, 1024
-};
-
-// Bitmap optimization tables
-static uint32_t g_bitmap_cache[BITMAP_CACHE_SIZE];
-static volatile LONG g_bitmap_cache_valid = 0;
+// Legacy size-class and bitmap tables removed
 
 // Original function pointers
 static void* (__cdecl* orig_malloc)(size_t) = nullptr;
@@ -343,77 +321,9 @@ static inline double GetElapsedMs(LARGE_INTEGER start, LARGE_INTEGER end) {
     return (double)(end.QuadPart - start.QuadPart) * 1000.0 / g_stats.perf_frequency.QuadPart;
 }
 
-// Size class calculation (16-byte granularity)
-static __forceinline uint32_t GetSizeClass(size_t size) {
-    if (size == 0) return 0;
-    if (size > SMALL_BLOCK_THRESHOLD) return SIZE_CLASSES - 1;
-    
-    // Fast calculation: (size + 15) >> 4 - 1
-    uint32_t size_class = ((uint32_t)size + 15) >> 4;
-    return (size_class > 0) ? size_class - 1 : 0;
-}
-
-static __forceinline size_t GetClassSize(uint32_t size_class) {
-    return (size_class < SIZE_CLASSES) ? g_size_class_sizes[size_class] : 0;
-}
-
-// Small helpers
+// Small helpers (kept)
 static __forceinline SIZE_T AlignUp(SIZE_T x, SIZE_T align) { return (x + align - 1) & ~(align - 1); }
 static __forceinline SIZE_T MaxSZ(SIZE_T a, SIZE_T b) { return (a > b) ? a : b; }
-
-// Bitmap operations for fast free block discovery
-static __forceinline uint32_t FindFirstSetBit(uint32_t value) {
-    DWORD index;
-    return _BitScanForward(&index, value) ? index : 32;
-}
-
-static inline void SetBitmapBit(uint32_t* bitmap_low, uint32_t* bitmap_high, uint32_t bit) {
-    if (bit < 32) {
-        *bitmap_low |= (1U << bit);
-    } else {
-        *bitmap_high |= (1U << (bit - 32));
-    }
-}
-
-static inline void ClearBitmapBit(uint32_t* bitmap_low, uint32_t* bitmap_high, uint32_t bit) {
-    if (bit < 32) {
-        *bitmap_low &= ~(1U << bit);
-    } else {
-        *bitmap_high &= ~(1U << (bit - 32));
-    }
-}
-
-// Pool utilities
-static __forceinline SIZE_T GetPoolUsed(const EnhancedMemoryPool* pool) {
-    return (SIZE_T)pool->used;
-}
-
-static __forceinline bool IsInPool(const void* ptr, const EnhancedMemoryPool* pool) {
-    return pool->base && ptr >= pool->base && ptr < (char*)pool->base + pool->size;
-}
-
-static __forceinline bool IsInAnyPool(const void* ptr) {
-    if (!ptr) return false;
-    for (int i = 0; i < g_num_pools; i++) {
-        if (IsInPool(ptr, g_pools[i])) return true;
-    }
-    return false;
-}
-
-// Segment utilities
-static __forceinline bool IsInCustomHeap(const void* ptr) {
-    if (!ptr || !g_custom_heap.segments) return false;
-    
-    for (LONG i = 0; i < g_custom_heap.segment_count; i++) {
-        MemorySegment* segment = &g_custom_heap.segments[i];
-        if (segment->segment_base && 
-            ptr >= segment->segment_base && 
-            ptr < (char*)segment->segment_base + SEGMENT_SIZE) {
-            return true;
-        }
-    }
-    return false;
-}
 
 // ============================================================================
 // ADVANCED LOGGING SYSTEM
@@ -1107,8 +1017,6 @@ static bool CustomHeapFree(void* ptr) {
 // ENHANCED POOL ALLOCATION - Tier 1 System
 // ============================================================================
 
-// Initialize enhanced memory pool (reserve big, commit on demand)
-static bool InitializeEnhancedPool(EnhancedMemoryPool* pool, SIZE_T desired_size, const char* name, uint32_t pool_id) {
     // Best-effort reserve: gradually reduce until success
     SIZE_T reserve_size = desired_size;
     void* base = nullptr;
@@ -1303,15 +1211,6 @@ static void* EnhancedPoolAllocate(size_t size) {
     
     LOG_DEBUG("Pool allocation: %zu bytes in %s at %p", size, pool->name, user_ptr);
     
-    return user_ptr;
-}
-
-// ============================================================================
-// MULTI-TIER ALLOCATION SYSTEM - The Heart of HeapMaster
-// ============================================================================
-
-// Three-tier allocation strategy implementation
-static void* MultiTierAllocate(size_t size) {
     if (size == 0 || size > MAX_ALLOCATION_SIZE) {
         return NULL;
     }
@@ -1399,11 +1298,6 @@ allocation_success:
     }
 #endif
     
-    return result;
-}
-
-// Multi-tier deallocation
-static void MultiTierFree(void* ptr) {
     if (!ptr) return;
     
     InterlockedIncrement64(&g_stats.total_deallocations);
@@ -1469,8 +1363,12 @@ static void* __cdecl HookedMallocMT(size_t size) {
     if (!g_system_initialized) {
         return orig_malloc ? orig_malloc(size) : NULL;
     }
-    
-    return MultiTierAllocate(size);
+    void* p = rpmalloc(size);
+    if (p) {
+        InterlockedIncrement64(&g_t_allocs);
+        InterlockedExchangeAdd64(&g_t_bytes_alloc, (LONG64)size);
+    }
+    return p;
 }
 
 static void __cdecl HookedFreeMT(void* ptr) {
@@ -1481,7 +1379,11 @@ static void __cdecl HookedFreeMT(void* ptr) {
         return;
     }
     
-    MultiTierFree(ptr);
+    // Route frees to rpmalloc
+    size_t sz = rpmalloc_usable_size(ptr);
+    rpfree(ptr);
+    InterlockedIncrement64(&g_t_frees);
+    if (sz) InterlockedExchangeAdd64(&g_t_bytes_free, (LONG64)sz);
 }
 
 static void* __cdecl HookedCallocMT(size_t num, size_t size) {
@@ -1492,15 +1394,17 @@ static void* __cdecl HookedCallocMT(size_t num, size_t size) {
     if (num == 0 || size == 0) return NULL;
     
     // Check for overflow
-    if (num > MAX_ALLOCATION_SIZE / size) {
+    if (num > (SIZE_MAX / size)) {
         return NULL;
     }
     
-    size_t total = num * size;
-    void* ptr = MultiTierAllocate(total);
-    
-    // Memory is already zeroed by our allocation system
-    return ptr;
+// Use rpmalloc zero-initialized allocation
+    void* p = rpcalloc(num, size);
+    if (p) {
+        InterlockedIncrement64(&g_t_allocs);
+        InterlockedExchangeAdd64(&g_t_bytes_alloc, (LONG64)(num * size));
+    }
+    return p;
 }
 
 static void* __cdecl HookedReallocMT(void* ptr, size_t size) {
@@ -1508,53 +1412,30 @@ static void* __cdecl HookedReallocMT(void* ptr, size_t size) {
         return orig_realloc ? orig_realloc(ptr, size) : NULL;
     }
     
-    // Handle special cases
+    // Handle special cases with rpmalloc
     if (!ptr) {
-        return HookedMallocMT(size);
+        void* p = rpmalloc(size);
+        if (p) {
+            InterlockedIncrement64(&g_t_allocs);
+            InterlockedExchangeAdd64(&g_t_bytes_alloc, (LONG64)size);
+        }
+        return p;
     }
-    
     if (size == 0) {
-        HookedFreeMT(ptr);
+        rpfree(ptr);
+        InterlockedIncrement64(&g_t_frees);
         return NULL;
     }
-    
-    // Try to determine old size for copy operation
-    size_t old_size = 0;
-    bool is_pool_ptr = IsInAnyPool(ptr);
-    bool is_heap_ptr = IsInCustomHeap(ptr);
-    
-    if (is_pool_ptr || is_heap_ptr) {
-        HeapAllocHeader* header = ((HeapAllocHeader*)ptr) - 1;
-        __try {
-            if (header->magic == 0xDEADC0DE) {
-                old_size = header->size;
-            }
-        }
-        __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Fall back to conservative estimate
-            old_size = size;
-        }
-    } else {
-        // System allocation - we don't know the old size
-        old_size = size; // Conservative estimate
+    size_t oldsz = rpmalloc_usable_size(ptr);
+    void* np = rprealloc(ptr, size);
+    if (np) {
+        // account old as free, new as alloc
+        if (oldsz) InterlockedExchangeAdd64(&g_t_bytes_free, (LONG64)oldsz);
+        InterlockedIncrement64(&g_t_frees);
+        InterlockedIncrement64(&g_t_allocs);
+        InterlockedExchangeAdd64(&g_t_bytes_alloc, (LONG64)size);
     }
-    
-    // Allocate new block
-    void* new_ptr = MultiTierAllocate(size);
-    if (!new_ptr) {
-        return NULL;
-    }
-    
-    // Copy data
-    if (old_size > 0) {
-        size_t copy_size = (old_size < size) ? old_size : size;
-        memcpy(new_ptr, ptr, copy_size);
-    }
-    
-    // Free old allocation
-    MultiTierFree(ptr);
-    
-    return new_ptr;
+    return np;
 }
 
 // ============================================================================
@@ -1760,88 +1641,188 @@ static void InitializeSystemInformation() {
              g_processor_count, g_page_size, g_process_heap, g_fallback_heap);
 }
 
+static void ApplyLoadedConfig() {
+    if (g_cfg.useVanillaHeaps) {
+        LOG_INFO("Safe mode: using vanilla heaps (no hooks)");
+        return;
+    }
+    // Apply budgets (memory + managers)
+    if (g_cfg.budgetPreset >= 0 && g_cfg.budgetPreset <= 4) {
+        MemoryBudgetConfig b = GetPresetConfig((BudgetPreset)g_cfg.budgetPreset);
+        auto MB = [](uint32_t mb){ return (DWORD)((uint64_t)mb * 1024ULL * 1024ULL); };
+        if (g_cfg.exteriorTextureMB) b.exterior_texture = MB(g_cfg.exteriorTextureMB);
+        if (g_cfg.interiorGeometryMB) b.interior_geometry = MB(g_cfg.interiorGeometryMB);
+        if (g_cfg.interiorTextureMB) b.interior_texture = MB(g_cfg.interiorTextureMB);
+        if (g_cfg.interiorWaterMB) b.interior_water = MB(g_cfg.interiorWaterMB);
+        if (g_cfg.actorMemoryMB) b.actor_memory = MB(g_cfg.actorMemoryMB);
+        ApplyBudgetConfig(&b);
+        LOG_INFO("Budgets applied (preset %d)", g_cfg.budgetPreset);
+    }
+    // Apply performance caps
+    PerformanceConfig pc{};
+    pc.max_ms_per_frame = g_cfg.maxMsPerFrame;
+    pc.max_texture_memory_mb = g_cfg.maxTextureMB;
+    pc.max_geometry_memory_mb = g_cfg.maxGeometryMB;
+    pc.max_particle_systems = g_cfg.maxParticleSystems;
+    pc.relax_frame_limits = g_cfg.relaxFrameLimits;
+    pc.disable_aggressive_culling = g_cfg.disableAggressiveCulling;
+    ApplyPerformancePatches(&pc);
+    if (pc.disable_aggressive_culling) DisableAggressiveCulling();
+    // Reset VirtualFree hook with new config
+    ShutdownVirtualFreeHook();
+    VirtualFreeHookConfig vfc{};
+    vfc.delay_decommit = g_cfg.vfDelayDecommit;
+    vfc.prevent_release = g_cfg.vfPreventRelease;
+    vfc.delay_ms = g_cfg.vfDelayMs;
+    vfc.min_keep_size = (size_t)g_cfg.vfMinKeepKB * 1024ULL;
+    vfc.log_operations = g_cfg.vfLog;
+    InitVirtualFreeHook(&vfc);
+}
+
 static void InitializeMultiTierSystem() {
     if (InterlockedCompareExchange(&g_system_initialized, 1, 0) != 0) {
         return;
     }
     
-    LOG_INFO("=== MemoryPoolNVSE HeapMaster v%s Initializing ===", PLUGIN_VERSION_STRING);
-    LOG_INFO("%s", PLUGIN_DESCRIPTION);
+    LOG_INFO("=== MemoryPoolNVSE rpmalloc Initializing ===");
     
-    // Initialize critical sections
+    // Initialize critical sections and system info
     if (!InitializeCriticalSections()) {
         LOG_ERROR("Critical failure: Could not initialize critical sections");
         InterlockedExchange(&g_system_initialized, 0);
         return;
     }
-    
-    // Initialize system information
     InitializeSystemInformation();
     
-    // Initialize rpmalloc (safe, even if not primary allocator)
-    rpmalloc_initialize(0);
-    
-    // Set memory manager mode to hybrid
-    g_memory_mode = MEMORY_MODE_HYBRID;
-    
-    // Initialize enhanced memory pools
-    bool pools_ok = true;
-    pools_ok &= InitializeEnhancedPool(&g_primary_pool, PRIMARY_POOL_SIZE, "Primary Pool", 1);
-    pools_ok &= InitializeEnhancedPool(&g_secondary_pool, SECONDARY_POOL_SIZE, "Secondary Pool", 2);
-    pools_ok &= InitializeEnhancedPool(&g_texture_pool, TEXTURE_POOL_SIZE, "Texture Pool", 3);
-    
-    if (!pools_ok) {
-        LOG_ERROR("Critical failure: Could not initialize memory pools");
-        InterlockedExchange(&g_system_initialized, 0);
+    // Load INI config
+    LoadOverdriveConfig(g_cfg);
+
+    if (g_cfg.useVanillaHeaps) {
+        LOG_INFO("Safe mode: using vanilla heaps (no hooks)");
         return;
     }
-    
-    // Initialize ScrapHeap cache system
-#if ENABLE_SCRAP_CACHE_SYSTEM
-    if (!InitializeScrapCache()) {
-        LOG_WARN("ScrapHeap cache initialization failed - continuing without cache");
+
+    // Initialize rpmalloc as the allocator
+    rpmalloc_initialize(0);
+
+    // Apply budgets (memory + managers)
+    if (g_cfg.budgetPreset >= 0 && g_cfg.budgetPreset <= 4) {
+        MemoryBudgetConfig b = GetPresetConfig((BudgetPreset)g_cfg.budgetPreset);
+        // Override with custom MB if specified
+        auto MB = [](uint32_t mb){ return (DWORD)((uint64_t)mb * 1024ULL * 1024ULL); };
+        if (g_cfg.exteriorTextureMB) b.exterior_texture = MB(g_cfg.exteriorTextureMB);
+        if (g_cfg.interiorGeometryMB) b.interior_geometry = MB(g_cfg.interiorGeometryMB);
+        if (g_cfg.interiorTextureMB) b.interior_texture = MB(g_cfg.interiorTextureMB);
+        if (g_cfg.interiorWaterMB) b.interior_water = MB(g_cfg.interiorWaterMB);
+        if (g_cfg.actorMemoryMB) b.actor_memory = MB(g_cfg.actorMemoryMB);
+        ApplyBudgetConfig(&b);
+        LOG_INFO("Budgets applied (preset %d)", g_cfg.budgetPreset);
     }
-#endif
-    
-    // Initialize custom heap manager
-#if ENABLE_SEGMENT_MANAGEMENT
-    if (!InitializeCustomHeap()) {
-        LOG_WARN("Custom heap manager initialization failed - continuing without custom heap");
-    }
-#endif
-    
-    // Install memory hooks (base module) then across all loaded modules
+
+    // Apply performance caps
+    PerformanceConfig pc{};
+    pc.max_ms_per_frame = g_cfg.maxMsPerFrame;
+    pc.max_texture_memory_mb = g_cfg.maxTextureMB;
+    pc.max_geometry_memory_mb = g_cfg.maxGeometryMB;
+    pc.max_particle_systems = g_cfg.maxParticleSystems;
+    pc.relax_frame_limits = g_cfg.relaxFrameLimits;
+    pc.disable_aggressive_culling = g_cfg.disableAggressiveCulling;
+    ApplyPerformancePatches(&pc);
+    if (pc.disable_aggressive_culling) DisableAggressiveCulling();
+
+    // Install malloc/free hooks for all modules
     InstallMultiTierMemoryHooks();
     InstallHooksAcrossModules();
-    
-// Apply budget patches (placeholder - implement if needed)
-#if ENABLE_MEMORY_BUDGETS
-    LOG_INFO("Memory budget patches ready for implementation");
-#endif
-    
-    LOG_INFO("=== HeapMaster Initialization Complete ===");
-    SIZE_T total_reserved = 0;
-    for (int i = 0; i < g_num_pools; ++i) total_reserved += g_pools[i]->size;
-    LOG_INFO("Multi-tier system active: %.2f GB total reserved", 
-             (double)total_reserved / (1024.0*1024.0*1024.0));
-    
-    // System initialization complete
-    LOG_INFO("HeapMaster system fully operational with %d memory tiers", 5);
+
+    // Initialize VirtualFree hook
+    VirtualFreeHookConfig vfc{};
+    vfc.delay_decommit = g_cfg.vfDelayDecommit;
+    vfc.prevent_release = g_cfg.vfPreventRelease;
+    vfc.delay_ms = g_cfg.vfDelayMs;
+    vfc.min_keep_size = (size_t)g_cfg.vfMinKeepKB * 1024ULL;
+    vfc.log_operations = g_cfg.vfLog;
+    InitVirtualFreeHook(&vfc);
+
+    LOG_INFO("=== rpmalloc Initialization Complete ===");
 }
 
 // ============================================================================
 // NVSE PLUGIN INTERFACE
 // ============================================================================
 
+// NVSE command implementations (minimal, param-less)
+static bool Cmd_ReloadOverdrive_Execute(COMMAND_ARGS) {
+    LoadOverdriveConfig(g_cfg);
+    // Reapply config (budgets/perf/VirtualFree)
+    ShutdownVirtualFreeHook();
+    ApplyLoadedConfig();
+    if (result) *result = 1.0;
+    return true;
+}
+
+static bool Cmd_GetBudgets_Execute(COMMAND_ARGS) {
+    MemoryBudgetConfig cur{}; GetCurrentBudgets(&cur);
+    LOG_INFO("Budgets: exteriorTex=%uMB interiorTex=%uMB interiorGeo=%uMB interiorWater=%uMB actor=%uMB",
+             (unsigned)(cur.exterior_texture/ (1024*1024)), (unsigned)(cur.interior_texture/ (1024*1024)),
+             (unsigned)(cur.interior_geometry/ (1024*1024)), (unsigned)(cur.interior_water/ (1024*1024)),
+             (unsigned)(cur.actor_memory/ (1024*1024)));
+    if (result) *result = (double)(cur.exterior_texture / (1024*1024));
+    return true;
+}
+
+static bool Cmd_DumpHeaps_Execute(COMMAND_ARGS) {
+    VirtualFreeStats vfs{}; GetVirtualFreeStats(&vfs);
+    LOG_INFO("Heaps: allocs=%lld frees=%lld bytes_alloc=%lld bytes_free=%lld vfree_calls=%ld kept=%zu",
+             (long long)g_t_allocs, (long long)g_t_frees,
+             (long long)g_t_bytes_alloc, (long long)g_t_bytes_free,
+             vfs.total_calls, vfs.bytes_kept_committed);
+    if (result) *result = 1.0;
+    return true;
+}
+
+static void WriteTelemetryIfDue() {
+    if (!g_cfg.telemetryEnabled) return;
+    LONG frame = InterlockedIncrement(&g_frame_counter);
+    if ((uint32_t)frame % (g_cfg.telemetryPeriodFrames ? g_cfg.telemetryPeriodFrames : 300) != 0) return;
+
+    // Prepare CSV line
+    VirtualFreeStats vfs{}; GetVirtualFreeStats(&vfs);
+    char line[512];
+    _snprintf_s(line, _TRUNCATE, "%lld,%lld,%lld,%lld,%ld,%ld,%ld,%zu\r\n",
+                (long long)g_t_allocs, (long long)g_t_frees,
+                (long long)g_t_bytes_alloc, (long long)g_t_bytes_free,
+                vfs.total_calls, vfs.decommit_blocked, vfs.decommit_delayed,
+                vfs.bytes_kept_committed);
+
+    HANDLE h = CreateFileA(g_cfg.telemetryFile, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD written = 0; SetFilePointer(h, 0, NULL, FILE_END);
+        // Write header once if empty
+        DWORD size = GetFileSize(h, NULL);
+        if (size == 0) {
+            const char* header = "allocs,frees,bytes_alloc,bytes_free,vfree_calls,decommit_blocked,decommit_delayed,bytes_kept\r\n";
+            WriteFile(h, header, (DWORD)strlen(header), &written, NULL);
+        }
+        WriteFile(h, line, (DWORD)strlen(line), &written, NULL);
+        CloseHandle(h);
+    }
+}
+
 static void MessageHandler(NVSEMessagingInterface::Message* msg) {
     switch (msg->type) {
         case NVSEMessagingInterface::kMessage_PostPostLoad:
             InitializeMultiTierSystem();
             break;
-            
+        case NVSEMessagingInterface::kMessage_MainGameLoop:
+            // Periodic background tasks
+            WriteTelemetryIfDue();
+            // Let VirtualFree hook release delayed frees gradually
+            FlushDelayedFrees();
+            break;
         case NVSEMessagingInterface::kMessage_ExitGame:
         case NVSEMessagingInterface::kMessage_ExitToMainMenu:
-            LOG_INFO("Game session ending - HeapMaster statistics logged");
+            LOG_INFO("Game session ending - statistics logged");
             break;
     }
 }
@@ -1859,22 +1840,22 @@ bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info) {
 }
 
 bool NVSEPlugin_Load(NVSEInterface* nvse) {
-    // Try to acquire messaging interface (prefer official ID 3, then fallback to 2)
-    NVSEMessagingInterface* msgInterface = (NVSEMessagingInterface*)nvse->QueryInterface(3);
-    if (!msgInterface) {
-        msgInterface = (NVSEMessagingInterface*)nvse->QueryInterface(2);
+    // Register NVSE commands if available
+    if (nvse->RegisterCommand) {
+        static CommandInfo kReloadInfo = {"OverdriveReload", "odreload", 0, "Reload Overdrive INI and reapply", 0, 0, nullptr, Cmd_ReloadOverdrive_Execute};
+        static CommandInfo kBudgetsInfo = {"OverdriveGetBudgets", "odbudgets", 0, "Log current budgets", 0, 0, nullptr, Cmd_GetBudgets_Execute};
+        static CommandInfo kDumpHeapsInfo = {"OverdriveDumpHeaps", "odheaps", 0, "Log heap/telemetry counters", 0, 0, nullptr, Cmd_DumpHeaps_Execute};
+        nvse->RegisterCommand(&kReloadInfo);
+        nvse->RegisterCommand(&kBudgetsInfo);
+        nvse->RegisterCommand(&kDumpHeapsInfo);
     }
 
-    bool listenerRegistered = false;
+    NVSEMessagingInterface* msgInterface = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging);
     if (msgInterface && msgInterface->RegisterListener) {
-        listenerRegistered = msgInterface->RegisterListener(nvse->GetPluginHandle(), "NVSE", (void*)MessageHandler);
-    }
-
-    // If messaging is unavailable or registration failed, initialize immediately
-    if (!listenerRegistered) {
+        msgInterface->RegisterListener(nvse->GetPluginHandle(), "NVSE", (void*)MessageHandler);
+    } else {
         InitializeMultiTierSystem();
     }
-
     return true;
 }
 
@@ -1891,7 +1872,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         case DLL_PROCESS_DETACH:
             // Mark shutdown in progress
             InterlockedExchange(&g_shutting_down, 1);
-            // Clean up rpmalloc if initialized
+            // Flush and shutdown hooks/allocators
+            FlushDelayedFrees();
+            ShutdownVirtualFreeHook();
             rpmalloc_finalize();
             break;
     }
