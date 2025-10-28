@@ -4,13 +4,16 @@
 #pragma once
 #include <windows.h>
 #include <stdint.h>
+#include "AddressDiscovery.h"
+#include "overdrive_log.h"
 
 // Helper to convert RVA to actual address (account for module base/ASLR)
 static inline HMODULE __mb_GetGameBase() {
     return GetModuleHandleA(NULL);
 }
 static inline void* __mb_RVA(uint32_t offset) {
-    return (void*)((uintptr_t)__mb_GetGameBase() + (uintptr_t)offset);
+    // Try robust resolver (pattern/exports), fallback to base+RVA
+    return AddrDisc::ResolveRVA(offset);
 }
 
 // Memory budget RVAs (initialization sites in code/data)
@@ -133,62 +136,272 @@ inline MemoryBudgetConfig GetPresetConfig(BudgetPreset preset) {
     return config;
 }
 
+// Result structure for patch operations
+struct BudgetPatchResult {
+    bool success;
+    DWORD old_value;
+    DWORD new_value;
+    const char* name;
+    DWORD error_code;
+};
+
 // Patch a single budget value in memory/code (RVA -> absolute)
-inline bool PatchBudgetValue(uint32_t rva, DWORD newValue) {
+inline BudgetPatchResult PatchBudgetValue(uint32_t rva, DWORD newValue, const char* name) {
+    BudgetPatchResult result = { false, 0, newValue, name, 0 };
+    
+    // Get address from RVA
     void* addr = __mb_RVA(rva);
-    DWORD oldProtect;
-    
-    if (!VirtualProtect(addr, sizeof(DWORD), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        return false;
+    if (!addr) {
+        result.error_code = GetLastError();
+        LOG_ERROR("Failed to resolve RVA 0x%08X for %s (error: 0x%08X)", rva, name, result.error_code);
+        return result;
     }
+
+    // Read current value
+    result.old_value = *(DWORD*)addr;
     
+    // Skip if already patched
+    if (result.old_value == newValue) {
+        result.success = true;
+        LOG_DEBUG("%s already set to 0x%08X", name, newValue);
+        return result;
+    }
+
+    // Validate against expected default if known
+    uint32_t expected = 0;
+    switch (rva) {
+        case BUDGET_EXTERIOR_TEXTURE_ADDR: expected = DEFAULT_EXTERIOR_TEXTURE; break;
+        case BUDGET_INTERIOR_GEOMETRY_ADDR: expected = DEFAULT_INTERIOR_GEOMETRY; break;
+        case BUDGET_INTERIOR_TEXTURE_ADDR: expected = DEFAULT_INTERIOR_TEXTURE; break;
+        case BUDGET_INTERIOR_WATER_ADDR: expected = DEFAULT_INTERIOR_WATER; break;
+        case BUDGET_ACTOR_MEMORY_ADDR: expected = DEFAULT_ACTOR_MEMORY; break;
+    }
+
+    if (expected && !AddrDisc::ValidateDWORD(addr, expected, 0) && 
+        !AddrDisc::ValidateDWORD(addr, newValue, 0)) {
+        result.error_code = ERROR_INVALID_DATA;
+        LOG_ERROR("Validation failed for %s at 0x%p: expected ~0x%08X, got 0x%08X", 
+                 name, addr, expected, result.old_value);
+        return result;
+    }
+
+    // Change memory protection
+    DWORD oldProtect;
+    if (!VirtualProtect(addr, sizeof(DWORD), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        result.error_code = GetLastError();
+        LOG_ERROR("Failed to unprotect memory at 0x%p for %s (error: 0x%08X)", 
+                 addr, name, result.error_code);
+        return result;
+    }
+
+    // Patch the value
     *(DWORD*)addr = newValue;
     
-    VirtualProtect(addr, sizeof(DWORD), oldProtect, &oldProtect);
+    // Verify the write
+    DWORD verify = *(DWORD*)addr;
+    if (verify != newValue) {
+        result.error_code = ERROR_WRITE_FAULT;
+        LOG_ERROR("Verification failed for %s: wrote 0x%08X but got 0x%08X", 
+                 name, newValue, verify);
+    } else {
+        result.success = true;
+        LOG_INFO("Patched %s: 0x%08X -> 0x%08X", name, result.old_value, newValue);
+    }
+
+    // Restore protection
+    DWORD temp;
+    VirtualProtect(addr, sizeof(DWORD), oldProtect, &temp);
     FlushInstructionCache(GetCurrentProcess(), addr, sizeof(DWORD));
-    return true;
+    
+    return result;
 }
 
 // Patch a manager runtime value (RVA -> absolute)
-inline bool PatchManagerValue(uint32_t rva, DWORD newValue) {
+inline BudgetPatchResult PatchManagerValue(uint32_t rva, DWORD newValue, const char* name) {
+    BudgetPatchResult result = { false, 0, newValue, name, 0 };
+    
+    // Get address from RVA
     void* addr = __mb_RVA(rva);
+    if (!addr) {
+        result.error_code = GetLastError();
+        LOG_ERROR("Failed to resolve manager RVA 0x%08X for %s (error: 0x%08X)", 
+                 rva, name, result.error_code);
+        return result;
+    }
+
+    // Read current value
+    result.old_value = *(DWORD*)addr;
+    
+    // Skip if already set
+    if (result.old_value == newValue) {
+        result.success = true;
+        LOG_DEBUG("Manager %s already set to 0x%08X", name, newValue);
+        return result;
+    }
+
+    // Change memory protection
     DWORD oldProtect;
     if (!VirtualProtect(addr, sizeof(DWORD), PAGE_READWRITE, &oldProtect)) {
-        return false;
+        result.error_code = GetLastError();
+        LOG_ERROR("Failed to unprotect manager memory at 0x%p for %s (error: 0x%08X)", 
+                 addr, name, result.error_code);
+        return result;
     }
+
+    // Patch the value
     *(DWORD*)addr = newValue;
-    VirtualProtect(addr, sizeof(DWORD), oldProtect, &oldProtect);
-    return true;
+    
+    // Verify the write
+    DWORD verify = *(DWORD*)addr;
+    if (verify != newValue) {
+        result.error_code = ERROR_WRITE_FAULT;
+        LOG_ERROR("Manager update failed for %s: wrote 0x%08X but got 0x%08X", 
+                 name, newValue, verify);
+    } else {
+        result.success = true;
+        LOG_INFO("Updated manager %s: 0x%08X -> 0x%08X", name, result.old_value, newValue);
+    }
+
+    // Restore protection
+    DWORD temp;
+    VirtualProtect(addr, sizeof(DWORD), oldProtect, &temp);
+    
+    return result;
 }
 
-// Apply complete budget configuration (both init sites and live manager values)
-inline bool ApplyBudgetConfig(const MemoryBudgetConfig* config) {
+// Structure to track patch results
+struct BudgetPatchResults {
+    int total_patches;
+    int successful_patches;
+    int failed_patches;
+    bool all_succeeded;
+};
+
+// Forward declaration for current budget read
+inline bool GetCurrentBudgets(MemoryBudgetConfig* config);
+
+// Apply complete budget configuration with validation
+inline BudgetPatchResults ApplyBudgetConfig(const MemoryBudgetConfig* config) {
+    BudgetPatchResults results = {0};
+    if (!config) {
+        LOG_ERROR("Invalid config pointer");
+        return results;
+    }
+
+    LOG_INFO("Applying budget configuration...");
+    LOG_DEBUG("Exterior Texture: 0x%08X (%u MB)", 
+             config->exterior_texture, config->exterior_texture / (1024 * 1024));
+    LOG_DEBUG("Interior Geometry: 0x%08X (%u MB)", 
+             config->interior_geometry, config->interior_geometry / (1024 * 1024));
+    LOG_DEBUG("Interior Texture: 0x%08X (%u MB)", 
+             config->interior_texture, config->interior_texture / (1024 * 1024));
+    LOG_DEBUG("Interior Water: 0x%08X (%u MB)", 
+             config->interior_water, config->interior_water / (1024 * 1024));
+    LOG_DEBUG("Actor Memory: 0x%08X (%u MB)", 
+             config->actor_memory, config->actor_memory / (1024 * 1024));
+
+    // Define all patches to apply
+    struct PatchDef {
+        uint32_t rva;
+        DWORD value;
+        const char* name;
+        bool is_manager;
+    };
+
+    PatchDef patches[] = {
+        // Code patches (affect future initializations)
+        {BUDGET_EXTERIOR_TEXTURE_ADDR, config->exterior_texture, "Exterior Texture (Code)", false},
+        {BUDGET_INTERIOR_GEOMETRY_ADDR, config->interior_geometry, "Interior Geometry (Code)", false},
+        {BUDGET_INTERIOR_TEXTURE_ADDR, config->interior_texture, "Interior Texture (Code)", false},
+        {BUDGET_INTERIOR_WATER_ADDR, config->interior_water, "Interior Water (Code)", false},
+        {BUDGET_ACTOR_MEMORY_ADDR, config->actor_memory, "Actor Memory (Code)", false},
+        
+        // Manager patches (affect current session)
+        {MANAGER_EXTERIOR_TEXTURE, config->exterior_texture, "Exterior Texture (Manager)", true},
+        {MANAGER_EXTERIOR_GEOMETRY, config->interior_geometry, "Exterior Geometry (Manager)", true},
+        {MANAGER_EXTERIOR_WATER, config->interior_water, "Exterior Water (Manager)", true},
+        {MANAGER_INTERIOR_TEXTURE, config->interior_texture, "Interior Texture (Manager)", true},
+        {MANAGER_INTERIOR_GEOMETRY, config->interior_geometry, "Interior Geometry (Manager)", true},
+        {MANAGER_INTERIOR_WATER, config->interior_water, "Interior Water (Manager)", true},
+        {MANAGER_ACTOR_MEMORY, config->actor_memory, "Actor Memory (Manager)", true}
+    };
+
+    // Apply all patches
+    for (const auto& patch : patches) {
+        results.total_patches++;
+        
+        BudgetPatchResult result = patch.is_manager ?
+            PatchManagerValue(patch.rva, patch.value, patch.name) :
+            PatchBudgetValue(patch.rva, patch.value, patch.name);
+            
+        if (result.success) {
+            results.successful_patches++;
+        } else {
+            results.failed_patches++;
+            LOG_ERROR("Failed to patch %s: error 0x%08X", patch.name, result.error_code);
+        }
+    }
+
+    // Verify all manager values
+    MemoryBudgetConfig current;
+    GetCurrentBudgets(&current);
+    
+    bool verified = 
+        current.exterior_texture == config->exterior_texture &&
+        current.interior_geometry == config->interior_geometry &&
+        current.interior_texture == config->interior_texture &&
+        current.interior_water == config->interior_water &&
+        current.actor_memory == config->actor_memory;
+
+    if (!verified) {
+        LOG_ERROR("Budget verification failed! Some values were not applied correctly");
+        LOG_INFO("Expected: Tex=0x%X Geo=0x%X Water=0x%X Actor=0x%X",
+                config->exterior_texture, config->interior_geometry,
+                config->interior_water, config->actor_memory);
+        LOG_INFO("Got:      Tex=0x%X Geo=0x%X Water=0x%X Actor=0x%X",
+                current.exterior_texture, current.interior_geometry,
+                current.interior_water, current.actor_memory);
+    } else {
+        LOG_INFO("Budget configuration applied and verified successfully");
+    }
+
+    results.all_succeeded = (results.failed_patches == 0) && verified;
+    
+    LOG_INFO("Budget patching complete: %d/%d successful, %d failed", 
+            results.successful_patches, results.total_patches, results.failed_patches);
+            
+    return results;
+}
+
+// Get current budget values from runtime managers with validation
+inline bool GetCurrentBudgets(MemoryBudgetConfig* config) {
+    if (!config) return false;
+    
     bool success = true;
     
-    // Patch code/data init constants (affects future inits)
-    success &= PatchBudgetValue(BUDGET_EXTERIOR_TEXTURE_ADDR, config->exterior_texture);
-    success &= PatchBudgetValue(BUDGET_INTERIOR_GEOMETRY_ADDR, config->interior_geometry);
-    success &= PatchBudgetValue(BUDGET_INTERIOR_TEXTURE_ADDR, config->interior_texture);
-    success &= PatchBudgetValue(BUDGET_INTERIOR_WATER_ADDR, config->interior_water);
-    success &= PatchBudgetValue(BUDGET_ACTOR_MEMORY_ADDR, config->actor_memory);
-
-    // Patch live manager runtime values (affects current session immediately)
-    success &= PatchManagerValue(MANAGER_EXTERIOR_TEXTURE, config->exterior_texture);
-    success &= PatchManagerValue(MANAGER_EXTERIOR_GEOMETRY, config->interior_geometry);
-    success &= PatchManagerValue(MANAGER_EXTERIOR_WATER, config->interior_water);
-    success &= PatchManagerValue(MANAGER_INTERIOR_TEXTURE, config->interior_texture);
-    success &= PatchManagerValue(MANAGER_INTERIOR_GEOMETRY, config->interior_geometry);
-    success &= PatchManagerValue(MANAGER_INTERIOR_WATER, config->interior_water);
-    success &= PatchManagerValue(MANAGER_ACTOR_MEMORY, config->actor_memory);
+    #define SAFE_READ_RVA(rva, dest) \
+        do { \
+            void* addr = __mb_RVA(rva); \
+            if (addr) { \
+                __try { \
+                    (dest) = *(DWORD*)addr; \
+                } __except(EXCEPTION_EXECUTE_HANDLER) { \
+                    LOG_ERROR("Exception reading RVA 0x%08X", rva); \
+                    success = false; \
+                } \
+            } else { \
+                LOG_ERROR("Failed to resolve RVA 0x%08X", rva); \
+                success = false; \
+            } \
+        } while(0)
+    
+    SAFE_READ_RVA(MANAGER_EXTERIOR_TEXTURE, config->exterior_texture);
+    SAFE_READ_RVA(MANAGER_INTERIOR_GEOMETRY, config->interior_geometry);
+    SAFE_READ_RVA(MANAGER_INTERIOR_TEXTURE, config->interior_texture);
+    SAFE_READ_RVA(MANAGER_INTERIOR_WATER, config->interior_water);
+    SAFE_READ_RVA(MANAGER_ACTOR_MEMORY, config->actor_memory);
+    
+    #undef SAFE_READ_RVA
     
     return success;
-}
-
-// Get current budget values from runtime managers
-inline void GetCurrentBudgets(MemoryBudgetConfig* config) {
-    config->exterior_texture = *(DWORD*)__mb_RVA(MANAGER_EXTERIOR_TEXTURE);
-    config->interior_geometry = *(DWORD*)__mb_RVA(MANAGER_INTERIOR_GEOMETRY);
-    config->interior_texture = *(DWORD*)__mb_RVA(MANAGER_INTERIOR_TEXTURE);
-    config->interior_water = *(DWORD*)__mb_RVA(MANAGER_INTERIOR_WATER);
-    config->actor_memory = *(DWORD*)__mb_RVA(MANAGER_ACTOR_MEMORY);
 }

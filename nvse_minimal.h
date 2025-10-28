@@ -6,27 +6,28 @@
 #include <cstdarg>
 #include <cstring>
 
-// Minimal NVSE plugin interface definitions
+// Minimal NVSE/xNVSE plugin interface definitions compatible with xNVSE
+// Prefer including the official header via nvse_compat.h when available.
+
 typedef unsigned long UInt32;
 typedef unsigned char UInt8;
 typedef UInt32 PluginHandle;
 
-enum {
-    kPluginHandle_Invalid = 0xFFFFFFFF,
-};
+enum { kPluginHandle_Invalid = 0xFFFFFFFF };
 
-enum {
-    kInterface_Messaging = 3,
-};
+// Interface IDs
+enum { kInterface_Messaging = 3 };
 
-// Version definitions (relaxed to ensure compatibility with NVSE/xNVSE)
-#define PACKED_NVSE_VERSION 0x00010000  // Minimum NVSE version (very permissive)
-#define RUNTIME_VERSION_1_4_MIN   0x01040000  // Fallout New Vegas 1.4.x.x minimum
+// Version guards
+#ifndef PACKED_NVSE_VERSION
+  #define PACKED_NVSE_VERSION 0x00010000
+#endif
+#ifndef RUNTIME_VERSION_1_4_MIN
+  #define RUNTIME_VERSION_1_4_MIN   0x01040000
+#endif
 
 struct PluginInfo {
-    enum {
-        kInfoVersion = 1
-    };
+    enum { kInfoVersion = 1 };
     UInt32 infoVersion;
     const char* name;
     UInt32 version;
@@ -40,11 +41,9 @@ struct NVSEMessagingInterface {
         void* data;
     };
 
-    enum {
-        kVersion = 6
-    };
+    enum { kVersion = 6 };
 
-    // Message types
+    // Message types (superset for xNVSE)
     enum {
         kMessage_PostLoad = 0,
         kMessage_ExitGame = 1,

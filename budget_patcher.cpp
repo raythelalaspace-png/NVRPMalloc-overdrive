@@ -7,9 +7,10 @@ static HMODULE GetGameBase() {
     return GetModuleHandleA(NULL);
 }
 
-// Calculate absolute address from RVA
+#include "AddressDiscovery.h"
+// Calculate absolute address from RVA (pattern-aware)
 static void* RVA(uint32_t offset) {
-    return (void*)((uintptr_t)GetGameBase() + offset);
+    return AddrDisc::ResolveRVA(offset);
 }
 
 ObjectBudgetConfig GetObjectBudgetPreset(int preset) {

@@ -1,5 +1,6 @@
 // performance_patcher.cpp - Performance Patcher Implementation
 #include "performance_patcher.h"
+#include "overdrive_log.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -8,9 +9,43 @@ static HMODULE GetGameBase() {
     return GetModuleHandleA(NULL);
 }
 
-// Calculate absolute address from RVA
+#include "AddressDiscovery.h"
+// Calculate absolute address from RVA (pattern-aware)
 static void* RVA(uint32_t offset) {
-    return (void*)((uintptr_t)GetGameBase() + offset);
+    return AddrDisc::ResolveRVA(offset);
+}
+
+static bool PatchFloatSafe(uint32_t rva, float newValue, float minVal, float maxVal, float expectedDefault, const char* name) {
+    void* addr = AddrDisc::ResolveRVA(rva);
+    if (!addr) { LOG_ERROR("Perf patch: failed to resolve %s (RVA=0x%08X)", name, rva); return false; }
+    if (newValue < minVal) newValue = minVal;
+    if (newValue > maxVal) newValue = maxVal;
+    // Validate expected default within 10% tolerance to avoid patching wrong place
+    if (expectedDefault > 0.0f && !AddrDisc::ValidateFloat(addr, expectedDefault, 0.10f)) {
+        LOG_WARN("Perf patch: %s validation weak at %p (expected ~%.2f)", name, addr, expectedDefault);
+    }
+    DWORD oldProt;
+    if (!VirtualProtect(addr, sizeof(float), PAGE_EXECUTE_READWRITE, &oldProt)) {
+        LOG_ERROR("Perf patch: unprotect failed for %s at %p", name, addr);
+        return false;
+    }
+    *(volatile float*)addr = newValue;
+    DWORD tmp; VirtualProtect(addr, sizeof(float), oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), addr, sizeof(float));
+    LOG_INFO("Perf patch: %s -> %.2f", name, newValue);
+    return true;
+}
+
+static bool NopFunction(void* address) {
+    if (!address) return false;
+    DWORD oldProt;
+    if (!VirtualProtect(address, 16, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+    // Write RET followed by NOP sled to neutralize function prologue safely
+    uint8_t bytes[16]; bytes[0] = 0xC3; for (int i=1;i<16;i++) bytes[i]=0x90;
+    memcpy(address, bytes, sizeof(bytes));
+    DWORD tmp; VirtualProtect(address, 16, oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), address, 16);
+    return true;
 }
 
 PerformanceConfig GetPerformancePreset(PerformancePreset preset) {
@@ -58,36 +93,19 @@ PerformanceConfig GetPerformancePreset(PerformancePreset preset) {
     return config;
 }
 
-static bool PatchFloat(void* address, float new_value) {
-    if (!address) return false;
-    
-    DWORD oldProtect;
-    if (!VirtualProtect(address, sizeof(float), PAGE_READWRITE, &oldProtect)) {
-        return false;
-    }
-    
-    *(float*)address = new_value;
-    
-    VirtualProtect(address, sizeof(float), oldProtect, &oldProtect);
-    return true;
-}
-
 bool ApplyPerformancePatches(const PerformanceConfig* config) {
     if (!config) return false;
     
     bool success = true;
     
-    // Patch frame time limit
-    success &= PatchFloat(RVA(PERF_MAX_MS_PER_FRAME_ADDR), config->max_ms_per_frame);
-    
-    // Patch texture memory limit
-    success &= PatchFloat(RVA(PERF_MAX_TEXTURE_MEMORY_ADDR), config->max_texture_memory_mb);
-    
-    // Patch geometry memory limit
-    success &= PatchFloat(RVA(PERF_MAX_GEOMETRY_MEMORY_ADDR), config->max_geometry_memory_mb);
-    
+    // Patch frame time limit (expect ~16.67 default)
+    success &= PatchFloatSafe(PERF_MAX_MS_PER_FRAME_ADDR,     config->max_ms_per_frame,      5.0f,   2000.0f, 16.67f, "Frame time limit");
+    // Patch texture memory limit (MB)
+    success &= PatchFloatSafe(PERF_MAX_TEXTURE_MEMORY_ADDR,   config->max_texture_memory_mb, 64.0f,  32768.0f, 512.0f, "Texture memory limit");
+    // Patch geometry memory limit (MB)
+    success &= PatchFloatSafe(PERF_MAX_GEOMETRY_MEMORY_ADDR,  config->max_geometry_memory_mb,32.0f,  16384.0f, 256.0f, "Geometry memory limit");
     // Patch particle system limit
-    success &= PatchFloat(RVA(PERF_MAX_PARTICLE_SYSTEMS_ADDR), config->max_particle_systems);
+    success &= PatchFloatSafe(PERF_MAX_PARTICLE_SYSTEMS_ADDR, config->max_particle_systems,  10.0f,  10000.0f, 100.0f, "Particle system limit");
     
     // Optionally disable aggressive culling
     if (config->disable_aggressive_culling) {
@@ -97,25 +115,6 @@ bool ApplyPerformancePatches(const PerformanceConfig* config) {
     return success;
 }
 
-// NOP out a function by replacing first instruction with RET
-static bool NopFunction(void* address) {
-    if (!address) return false;
-    
-    DWORD oldProtect;
-    if (!VirtualProtect(address, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        return false;
-    }
-    
-    // Write RET opcode (0xC3) to immediately return from function
-    *(uint8_t*)address = 0xC3;
-    
-    VirtualProtect(address, 1, oldProtect, &oldProtect);
-    FlushInstructionCache(GetCurrentProcess(), address, 1);
-    
-    return true;
-}
-
-// Store original bytes for restoration
 static uint8_t g_original_bytes[6][16];
 static bool g_bytes_saved = false;
 

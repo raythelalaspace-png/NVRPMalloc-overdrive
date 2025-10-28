@@ -32,6 +32,13 @@ bool LoadOverdriveConfig(OverdriveConfig& c) {
     // General
     c.useVanillaHeaps = ReadInt(iniPath, "General", "bUseVanillaHeaps", c.useVanillaHeaps ? 1 : 0) != 0;
     c.budgetPreset = ReadInt(iniPath, "General", "iBudgetPreset", c.budgetPreset);
+    c.detectCrossModuleMismatch = ReadInt(iniPath, "General", "bDetectCrossModuleMismatch", c.detectCrossModuleMismatch ? 1 : 0) != 0;
+    c.stackTraceDepth = (uint32_t)ReadInt(iniPath, "General", "iStackTraceDepth", (int)c.stackTraceDepth);
+
+    // Address space / arena
+    c.enableArena = ReadInt(iniPath, "AddressSpace", "bEnableArena", c.enableArena ? 1 : 0) != 0;
+    c.arenaMB = (uint32_t)ReadInt(iniPath, "AddressSpace", "iArenaMB", (int)c.arenaMB);
+    c.topDownOnNonArena = ReadInt(iniPath, "AddressSpace", "bTopDownOnNonArena", c.topDownOnNonArena ? 1 : 0) != 0;
 
     // Custom budgets (MB)
     c.exteriorTextureMB = ReadInt(iniPath, "Budgets", "ExteriorTextureMB", c.exteriorTextureMB);
@@ -71,12 +78,17 @@ bool LoadOverdriveConfig(OverdriveConfig& c) {
     c.vfDelayMs = (uint32_t)ReadInt(iniPath, "VirtualFree", "iDelayMs", (int)c.vfDelayMs);
     c.vfMinKeepKB = (uint32_t)ReadInt(iniPath, "VirtualFree", "iMinKeepKB", (int)c.vfMinKeepKB);
     c.vfLog = ReadInt(iniPath, "VirtualFree", "bLog", c.vfLog ? 1 : 0) != 0;
+    c.vfMaxKeptCommittedMB = (uint32_t)ReadInt(iniPath, "VirtualFree", "MaxKeptCommittedMB", (int)c.vfMaxKeptCommittedMB);
+    c.vfLowVATriggerMB = (uint32_t)ReadInt(iniPath, "VirtualFree", "LowVATriggerMB", (int)c.vfLowVATriggerMB);
 
     // Hooks
     c.hookHeapAPI = ReadInt(iniPath, "Hooks", "bHookHeapAPI", c.hookHeapAPI ? 1 : 0) != 0;
     c.hookVirtualAlloc = ReadInt(iniPath, "Hooks", "bHookVirtualAlloc", c.hookVirtualAlloc ? 1 : 0) != 0;
     c.heapHookThresholdKB = (uint32_t)ReadInt(iniPath, "Hooks", "iHeapHookThresholdKB", (int)c.heapHookThresholdKB);
     c.preferTopDownVA = ReadInt(iniPath, "Hooks", "bPreferTopDownVA", c.preferTopDownVA ? 1 : 0) != 0;
+    c.hookChainExisting = ReadInt(iniPath, "Hooks", "bHookChainExisting", c.hookChainExisting ? 1 : 0) != 0;
+    ReadString(iniPath, "Hooks", "sHookWhitelist", "", c.hookWhitelist, (DWORD)sizeof(c.hookWhitelist));
+    c.largeAllocThresholdMB = (uint32_t)ReadInt(iniPath, "Hooks", "LargeAllocThresholdMB", (int)c.largeAllocThresholdMB);
 
     // Telemetry
     c.telemetryEnabled = ReadInt(iniPath, "Telemetry", "bEnabled", c.telemetryEnabled ? 1 : 0) != 0;

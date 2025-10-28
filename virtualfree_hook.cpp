@@ -2,6 +2,7 @@
 #include "virtualfree_hook.h"
 #include <stdio.h>
 #include <string.h>
+#include "HighVAArena.h"
 
 // Original VirtualFree function pointer
 typedef BOOL (WINAPI* VirtualFree_t)(LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType);
@@ -10,6 +11,7 @@ static VirtualFree_t g_original_VirtualFree = nullptr;
 // Configuration
 static VirtualFreeHookConfig g_config = {};
 static VirtualFreeStats g_stats = {};
+static volatile LONG64 g_kept_current_bytes = 0; // quota-tracked current kept bytes
 static bool g_hook_active = false;
 
 // Delayed free queue (simple ring buffer)
@@ -56,18 +58,59 @@ static bool ShouldBlockRelease(LPVOID address, SIZE_T size) {
     return false;
 }
 
+static SIZE_T EstimateFreeSize(LPVOID address, SIZE_T size, DWORD freeType) {
+    if (freeType & MEM_DECOMMIT) return size;
+    if (freeType & MEM_RELEASE) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(address, &mbi, sizeof(mbi))) {
+            return (SIZE_T)mbi.RegionSize;
+        }
+    }
+    return size;
+}
+
+static void ForceFlushOneUnlocked() {
+    if (g_queue_tail == g_queue_head) return;
+    DelayedFree* item = &g_delayed_queue[g_queue_tail];
+    SIZE_T sz = item->size;
+    if (sz == 0) sz = EstimateFreeSize(item->address, item->size, item->freeType);
+    if (g_original_VirtualFree) g_original_VirtualFree(item->address, item->size, item->freeType);
+    g_queue_tail = (g_queue_tail + 1) % MAX_DELAYED_FREES;
+    InterlockedExchangeAdd64(&g_kept_current_bytes, -(LONG64)sz);
+}
+
 static void QueueDelayedFree(LPVOID address, SIZE_T size, DWORD freeType) {
+    SIZE_T sz = EstimateFreeSize(address, size, freeType);
     EnterCriticalSection(&g_queue_lock);
-    
+
+    // Quota enforcement: flush oldest until we have room, or bail if item exceeds quota alone
+    if (g_config.max_kept_committed_bytes) {
+        LONG64 cur = InterlockedAdd64(&g_kept_current_bytes, 0);
+        while ((SIZE_T)cur + sz > g_config.max_kept_committed_bytes && g_queue_tail != g_queue_head) {
+            ForceFlushOneUnlocked();
+            cur = InterlockedAdd64(&g_kept_current_bytes, 0);
+        }
+        if ((SIZE_T)cur + sz > g_config.max_kept_committed_bytes) {
+            LeaveCriticalSection(&g_queue_lock);
+            // No room; force free immediately
+            if (g_original_VirtualFree) g_original_VirtualFree(address, size, freeType);
+            return;
+        }
+    }
+
     LONG next = (g_queue_head + 1) % MAX_DELAYED_FREES;
     if (next != g_queue_tail) {  // Queue not full
         g_delayed_queue[g_queue_head].address = address;
-        g_delayed_queue[g_queue_head].size = size;
+        g_delayed_queue[g_queue_head].size = sz; // store estimated
         g_delayed_queue[g_queue_head].freeType = freeType;
         g_delayed_queue[g_queue_head].timestamp = GetTickCount();
         g_queue_head = next;
         
+        InterlockedExchangeAdd64(&g_kept_current_bytes, (LONG64)sz);
         InterlockedIncrement(&g_stats.decommit_delayed);
+    } else {
+        // Queue full: force immediate free
+        if (g_original_VirtualFree) g_original_VirtualFree(address, size, freeType);
     }
     
     LeaveCriticalSection(&g_queue_lock);
@@ -87,7 +130,7 @@ static void ProcessDelayedFrees(bool force) {
         if (elapsed >= g_config.delay_ms || force) {
             // Actually free the memory now
             g_original_VirtualFree(item->address, item->size, item->freeType);
-            
+            InterlockedExchangeAdd64(&g_kept_current_bytes, -(LONG64)item->size);
             g_queue_tail = (g_queue_tail + 1) % MAX_DELAYED_FREES;
         } else {
             break;  // Not ready yet
@@ -98,9 +141,47 @@ static void ProcessDelayedFrees(bool force) {
 }
 
 // Hooked VirtualFree function
+static bool LowVAAvailable() {
+    // Probe top-of-VA largest free region
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    uintptr_t maxA = (uintptr_t)si.lpMaximumApplicationAddress;
+    MEMORY_BASIC_INFORMATION mbi{};
+    SIZE_T largest = 0;
+    uint8_t* p = (uint8_t*)maxA;
+    for (int i=0;i<64 && p> (uint8_t*)si.lpMinimumApplicationAddress; ++i) {
+        if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
+        if (mbi.State == MEM_FREE) {
+            if (mbi.RegionSize > largest) largest = (SIZE_T)mbi.RegionSize;
+        }
+        if ((uintptr_t)mbi.BaseAddress < (uintptr_t)si.lpMinimumApplicationAddress + si.dwAllocationGranularity) break;
+        p = (uint8_t*)mbi.BaseAddress - si.dwAllocationGranularity;
+    }
+    SIZE_T thresh = (SIZE_T)g_config.low_va_trigger_mb * 1024ull * 1024ull;
+    if (thresh == 0) thresh = 64ull*1024ull*1024ull; // default 64MB
+    return largest < thresh;
+}
+
 static BOOL WINAPI Hooked_VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType) {
     if (!g_hook_active || !g_original_VirtualFree) {
         return g_original_VirtualFree ? g_original_VirtualFree(lpAddress, dwSize, dwFreeType) : FALSE;
+    }
+
+    // Safety: if VA low, flush and bypass delay/prevent
+    if (LowVAAvailable()) {
+        ProcessDelayedFrees(true);
+        g_config.delay_decommit = false; // backpressure: disable delay temporarily
+        g_config.prevent_release = false;
+    }
+
+    // Handle arena-backed frees first
+    if (lpAddress && HighVAAPI::IsActive() && HighVAAPI::Contains(lpAddress)) {
+        if ((dwFreeType & MEM_DECOMMIT) && dwSize > 0) {
+            if (HighVAAPI::Decommit(lpAddress, dwSize)) return TRUE;
+        }
+        if ((dwFreeType & MEM_RELEASE) && dwSize == 0) {
+            if (HighVAAPI::Release(lpAddress)) return TRUE;
+        }
+        // If flags invalid for arena, fallthrough to original
     }
     
     InterlockedIncrement(&g_stats.total_calls);
@@ -120,15 +201,16 @@ static BOOL WINAPI Hooked_VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwF
         if (ShouldBlockDecommit(lpAddress, dwSize)) {
             InterlockedIncrement(&g_stats.decommit_blocked);
             g_stats.bytes_kept_committed += dwSize;
-            
+            InterlockedExchangeAdd64(&g_kept_current_bytes, (LONG64)dwSize);
             if (g_config.log_operations) {
                 LogVirtualFree("  -> BLOCKED (keeping memory committed)");
             }
             return TRUE;  // Pretend success
         }
         
-        // Queue for delayed processing
+        // Queue for delayed processing (quota-aware)
         if (g_config.delay_decommit && g_config.delay_ms > 0) {
+            // Respect min_keep_size and quota via QueueDelayedFree
             QueueDelayedFree(lpAddress, dwSize, dwFreeType);
             return TRUE;  // Pretend success
         }
@@ -137,13 +219,18 @@ static BOOL WINAPI Hooked_VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwF
     // Handle MEM_RELEASE
     if (dwFreeType & MEM_RELEASE) {
         if (ShouldBlockRelease(lpAddress, dwSize)) {
-            InterlockedIncrement(&g_stats.release_blocked);
-            g_stats.bytes_kept_committed += dwSize;
-            
-            if (g_config.log_operations) {
-                LogVirtualFree("  -> BLOCKED (preventing release)");
+            // If quota exceeded or low VA, do not block
+            LONG64 cur = InterlockedAdd64(&g_kept_current_bytes, 0);
+            if (!g_config.max_kept_committed_bytes || (SIZE_T)cur < g_config.max_kept_committed_bytes) {
+                InterlockedIncrement(&g_stats.release_blocked);
+                SIZE_T est = EstimateFreeSize(lpAddress, dwSize, dwFreeType);
+                g_stats.bytes_kept_committed += est;
+                InterlockedExchangeAdd64(&g_kept_current_bytes, (LONG64)est);
+                if (g_config.log_operations) {
+                    LogVirtualFree("  -> BLOCKED (preventing release)");
+                }
+                return TRUE;  // Pretend success
             }
-            return TRUE;  // Pretend success
         }
     }
     
@@ -211,11 +298,14 @@ bool InitVirtualFreeHook(const VirtualFreeHookConfig* config) {
         g_config.delay_ms = 2000;  // 2 second delay (reduced from 5)
         g_config.min_keep_size = 256 * 1024;  // 256 KB minimum (reduced from 1MB)
         g_config.log_operations = false;
+        g_config.max_kept_committed_bytes = 256ull * 1024ull * 1024ull; // default 256MB quota
+        g_config.low_va_trigger_mb = 64; // default 64MB
     }
     
     InitializeCriticalSection(&g_queue_lock);
     memset(&g_stats, 0, sizeof(g_stats));
     memset(g_delayed_queue, 0, sizeof(g_delayed_queue));
+    InterlockedExchange64(&g_kept_current_bytes, 0);
     
     if (!HookIAT_VirtualFree()) {
         DeleteCriticalSection(&g_queue_lock);
@@ -292,6 +382,7 @@ void ShutdownVirtualFreeHook() {
 void GetVirtualFreeStats(VirtualFreeStats* stats) {
     if (stats) {
         *stats = g_stats;
+        stats->kept_committed_current = (size_t)InterlockedAdd64(&g_kept_current_bytes, 0);
     }
 }
 

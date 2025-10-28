@@ -109,6 +109,8 @@
     <ClCompile Include="virtualfree_hook.cpp" />
     <ClCompile Include="performance_patcher.cpp" />
     <ClCompile Include="OverdriveConfig.cpp" />
+    <ClCompile Include="HighVAArena.cpp" />
+    <ClCompile Include="AddressDiscovery.cpp" />
     <ClCompile Include="rpmalloc.c" />
     <ClCompile Include="malloc.c" />
   </ItemGroup>
@@ -122,6 +124,8 @@
     <ClInclude Include="virtualfree_hook.h" />
     <ClInclude Include="performance_patcher.h" />
     <ClInclude Include="OverdriveConfig.h" />
+    <ClInclude Include="HighVAArena.h" />
+    <ClInclude Include="AddressDiscovery.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
